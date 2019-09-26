@@ -758,10 +758,19 @@
     由于互斥锁的简洁性和高效性，互斥锁使用场景比信号量更严格，有以下约束条件：
     
     - 同一时刻只有一个线程可以持有互斥锁
+    
     - 只有锁持有者可以解锁
+    
     - 不允许递归加锁
+    
     - 进程持有互斥锁时不可退出
-    - 互斥锁必须使用官方API初始化
+    
+    - ```
+      
+      ```
+    
+      互斥锁必须使用官方API初始化
+    
     - 互斥体可以睡眠，不允许在中断处理程序或者中断下半部中使用（中断处理程序不允许睡眠）
     
     在中断上下文中选择自旋锁，如果临界区有睡眠、隐含睡眠的动作和内核API，应避免使用自旋锁。信号量与互斥锁的选择中，除非不满足上述条件，优先使用互斥锁。
@@ -781,3 +790,75 @@
     **等待队列：**
     
     等待队列本质上时一个双向链表，当运行中的进程需要获取某一资源而该资源暂时不能提供时，将进程挂入等待队列中等待该资源的释放，进程进入睡眠状态。
+    
+16. #### 中断管理
+
+    **Linux中断管理机制：**
+
+    Linux内核支持众多的处理器架构，系统角度Linux内核中断管理可分为4层：
+
+    - 硬件层，如CPU和中断控制器的连接
+    - 处理器架构管理，如CPU中断异常处理
+    - 中断控制器管理，如IRQ中断号的映射
+    - Linux内核通用中断处理器层，如中断注册和中断处理
+
+    **注册中断：**
+
+    注册中断API函数`request_irq()/request_threaded_irq()`使用的是Linux内核软件中断号（软件中断号或IRQ中断号），而不是硬件中断号。中断处理程序是内核用于响应终端的，运行在中断上下文中（不同于进程上下文），中断处理程序最基本的工作是通知硬件设备中断已经被接收。中断处理程序需要快速完成并且退出中断，为此Linux内核将中断处理程序分为上半部和下半部，上半部的硬件中断处理程序应该执行得越快越好。中断上下文：包括中断处理程序、Softirq软中断、tasklet等。中断线程化的目的是将中断处理中一些繁重的任务作为内核线程运行，从而实时进程可以有比中断线程更高的优先级，减小高优先级任务的延迟不可预测性，中断线程化在中断管理上下半部机制中属于下半部范畴。
+
+    ```c
+    // kernel/irq/manage.c
+    // irq：IRQ中断号 
+    // handler：主处理器(primary handler)，当主处理器为NULL且thread_fn不为NULL，那么执行默认主处理器					irq_default_handler()函数
+    // thread_fn：中断线程化的处理程序。thread_fn不为NULL，创建一个内核线程。handler与thread_fn不同时为NULL
+    // irqflags：中断标志位
+    // devname：终端名称
+    // dev_id：传递给中断处理程序的参数
+    int request_threaded_irq(unsigned int irq, irq_handler_t handler,
+    			 irq_handler_t thread_fn, unsigned long irqflags,
+    			 const char *devname, void *dev_id)
+    ```
+
+    **软中断：**
+
+    中断管理上下部机制希望上半部的硬件中断处理程序尽快执行并从硬件中断返回，原因：
+
+    - 硬件中断处理程序以异步方式执行，会打断其他重要的代码执行
+    - 硬件中断处理程序通常在关中断的情况下执行，使得处理期间CPU无法响应中断
+
+    中断管理上半部为了尽快返回，通常只完成整个中断处理任务的一小部分，如响应中断表明中断已被软件接收，简单处理如DMA操作，以及硬件中断处理完成时发送EOI信号给中断控制器等，这些工作对时间比较敏感。而中断处理任务中的一些计算任务，如数据复制、数据包封装和转发、计算时间较长的数据处理等，可以放到中断下半部执行。<u>软中断是预留给系统中对时间要求最为严格和最重要的下半部使用的，而且目前驱动只有块设备和网络子系统使用了软中断，系统静态定义了若干软中断类型，且Linux内核不希望用户再扩充新的软中断，如需要建议使用tasklet机制。</u>
+
+    ```c
+    // include/linux/interrupt.h
+    enum	//通过枚举静态声明软中断，索引号越小，软中断优先级越高，软中断处理中优先得到执行
+    {
+    	HI_SOFTIRQ = 0,		// 优先级为0，是最高优先级的软中断
+    	TIMER_SOFTIRQ,		// 优先级为1，用于定时器的软中断
+    	NET_TX_SOFTIRQ,		// 优先级为2，用于发送网络数据包的软中断
+    	NET_RX_SOFTIRQ,		// 优先级为3，用于接收网络数据包的软中断
+    	BLOCK_SOFTIRQ,		// 优先级为4，用于块设备的软中断
+    	IRQ_POLL_SOFTIRQ,
+    	TASKLET_SOFTIRQ,	// 优先级为6，专为tasklet机制设置的软中断
+    	SCHED_SOFTIRQ,		// 优先级为7，进程调度及负载均衡
+    	HRTIMER_SOFTIRQ, /* Unused, but kept as tools rely on the numbering. Sigh! */
+    	RCU_SOFTIRQ,    /* Preferable RCU should always be the last softirq */ // RCU软中断
+    	NR_SOFTIRQS
+    };
+    
+    struct tasklet_struct
+    {
+    	struct tasklet_struct *next;
+    	unsigned long state;
+    	atomic_t count;
+    	void (*func)(unsigned long);
+    	unsigned long data;
+    };
+    ```
+
+    tasklet是利用软中断实现的一种下半部机制，是软中断的一个变种，运行在软中断上下文中。每个CPU维护两个tasklet链表：一个是普通优先级的`tasklet_vec`，一个是高优先级的`task_hi_vec`，都属于Per-CPU变量。`tasklet_vec`使用软中断中的`TASKLET_SOFTIRQ`类型，优先级为`6`，而`task_hi_vec`使用软中断的`HI_SOFTIRQ`类型，优先级为`0`，是最高优先级的软中断。
+
+    `local_bh_disable()/local_bh_enable()`是内核提供的关闭软中断的锁机制，它们组成的临界区禁止本地CPU在中断返回前夕执行软中断，这个临界区称为BH临界区。软中断可再多个CPU上并行执行，软中断执行时间点是硬件中断返回前，硬中断退出上下文时，会先检查是否有pending的软中断，而后检查是否需要抢占当前进程，因此软中断总是抢占进程上下文。tasklet是串行执行的。可并行的软中断有着更好的性能，但需要考虑并发以及同步，而串行的tasklet性能差一些但更易用。
+
+    **工作队列机制：**
+
+    工作队列是除软中断和tasklet以外最常用的下半部机制之一，工作队列的基本思想是把work交由一个内核线程来执行，总是在进程上下文中执行。工作队列的优点是利用进程上下文来执行中断下半部执行，允许重新调度和睡眠，是异步执行的进程上下文，能解决软中断和tasklet执行时间过长导致的系统实时性下降等问题。CMWQ（Concurrency Managed Workqueue）提出工作线程池概念，工作线程池有两种：BOUND类型和UNBOUND类型。BOUND类型中每个CPU都有绑定的工作线程池，UNBOUND类型中工作线程池不绑定CPU。这两种线程池中又有两种线程池：普通优先级线程池和高优先级线程池。
